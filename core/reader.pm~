@@ -1,0 +1,234 @@
+#!/usr/bin/perl -w
+
+##
+# 
+# LOG:
+# 
+package reader;
+
+#use List::Util qw( min max );
+use Exporter;
+#use Async;
+require "Async.pm";
+require "mysql.pm";
+use Time::HiRes qw(usleep nanosleep time gettimeofday);
+use Data::Dumper;
+use vars qw($VERSION @ISA @EXPORT);
+use WWW::Curl::Easy;
+use JSON;
+
+$VERSION     = 1.00;
+@ISA         = qw(Exporter);
+@EXPORT      = ();
+
+##
+# __construct()
+sub new {
+	$class = shift;
+	$self = {
+	 'errorCode' => 0,
+	 'errorMessage' => '',
+	 'dataParser' => undef,
+	 'db' => undef,
+	};
+	bless $self, $class;
+	return $self;
+}
+
+
+sub setDataParser {
+	( $self, $dataParser ) = @_;
+	$self->{'dataParser'} = $dataParser;
+}
+
+sub setMysql {
+	( $self, $mysql ) = @_;
+	$self->{'db'} = $mysql;
+}
+
+## pobierz dane domeny, przetwórz wynik, przekaz do analizy
+sub runDomain {
+	( $self, $domainData ) = @_;
+	
+	$domain = $domainData->{'domain'};
+	@res = split("\n", $self->goDomain($domainData));
+	$statusHttp = $res[0];
+	$time = $res[1];
+	$statusResponse = $res[2];
+	$statusCounter = $res[3];
+	$json = $res[4];
+
+	print "domain($domain) ".new Dumper(\@res)."\n";
+
+	if ( $statusHttp eq "200" ) {
+		if ( $statusCounter > 0 ) {
+			$self->saveArchive(2, $domainData->{'id'}, $time, $json);
+		}
+		$self->processDomainResponse($statusResponse, $statusCounter, $json);
+	} else {
+		# save to log = not found
+	}
+	print "runDomain($domain) : $res\n";
+}
+
+## analiza przetworzonej odpowiedzi domeny; zapis logu lub wyniku w bazie
+sub processDomainResponse {
+	( $self, $domainData, $statusResponse, $statusCounter, $json ) = @_;
+
+	if ( $statusResponse eq "ok" ) {
+		if ( $statusCounter > 0 ) {
+				# save news and update lastID
+		}
+	} else if ( $statusResponse eq "error" ) {
+		# save to log = inside error
+		$statusCounter;
+	}
+}
+
+## POST data dla url serwera - uwzglednij wszystkie domeny w ramach serwera
+# @return string: POST DATA
+sub makeServerData {
+	( $self, $serwerId, $dependancy, $domainList ) = @_;
+	@domainsServ = ();
+	foreach $depID (keys %$dependancy) {
+		if ( $dependancy->{$depID} == $serwerId ) { push(@domainsServ, $depID); }
+	}
+
+	@domainsTab = ();
+	foreach $dID (keys %$domainList) {
+		if ( ! grep( /^$dID$/, @domainsServ ) ) { next; }
+		push(@domainsTab, $domainList->{$dID} );
+	}
+
+	return "domainData\nparam\n".encode_json(\@domainsTab);
+}
+
+## powiąż domeny z serwerami obsługującymi moduł "perl"
+# @param %domainList ( self->getDomainList() )
+# @param @serwerList ( keys self->getSerwerList() )
+# @return {domena_id} = serwer_id
+sub makeDependancy {
+	( $self, $serwerList, $domainList ) = @_;
+	%r = {};
+
+	foreach $dKey (keys %$domainList) {
+		if ( $domainList->{$dKey}{'domain'} eq "" ) { next; }
+		$sID = $domainList->{$dKey}{'serwer'};
+		$serverID = 0;
+		if ( grep( /^$sID$/, @$serwerList ) ) { $serverID = $sID; }
+		$r{ $dKey } = $serverID;
+	}
+
+	return %r;
+}
+
+
+## @return[id] = {id, domain, serwer, script, lastID, url}
+sub getDomainList {
+	( $self ) = @_;
+	$self->{'db'}->start();
+	
+	%r = ();
+	@lastIDSsql = $self->{'db'}->runQuery("SELECT domena,lastid FROM kcms_blogi_ostatniwpis ");
+	%lastIDS = {};
+	foreach $row (@lastIDSsql) {
+		$lastIDS{ $row->{'domena'} } = $row->{'lastid'};
+	}
+
+	@domains = $self->{'db'}->runQuery("SELECT id, domena, www, serwer, typ FROM kcms_domeny WHERE active =1 AND typ IN ( 2, 3 ) AND readerIG = '1' ");
+	$self->{'db'}->koniec();
+	
+	foreach $row (@domains) {
+		if ( $row->{'domena'} eq "" ) { next; }
+		%dv = {};
+		$dv{'id'} = $row->{'id'}; 
+		$dv{'domain'} = $row->{'domena'}; 
+		$dv{'serwer'} = $row->{'serwer'}; 
+		$dv{'script'} = $self->scriptType( $row->{'typ'} );
+		if (length $lastIDS->{ $row->{'domena'} }) { $dv{'lastID'} = $lastIDS->{ $row->{'domena'} }; }
+		else { $dv{'lastID'} = 0; }
+		$dv{'url'} = "http://". ( ($row->{'www'} eq "1") ? 'www.' : '' ) . $row->{'domena'}. "/readerIG/" ;
+		$r{ $row->{'id'} } = {%dv};
+	}
+
+	return %r;
+}
+
+##
+# @return[id] = {domain, url}
+sub getSerwerList {
+	( $self ) = @_;
+	$self->{'db'}->start();
+	@servs = $self->{'db'}->runQuery("SELECT id,domena,monitor_url FROM kcms_serwery WHERE active =1 AND monitor_url !=  '' ");
+	$self->{'db'}->koniec();
+	%r = ();
+	foreach $s (@servs) {
+		if ( $s->{'domena'} eq "" ) { next; }
+		%sv = {};
+		$sv{'domain'} = $s->{'domena'};
+		$sv{'url'} = $s->{'monitor_url'};
+		$r{ $s->{'id'} } = {%sv};
+	}
+	return %r;
+}
+
+sub scriptType {
+	( $self, $nr ) = @_;
+	if ( $nr eq "2" ) { return "Wordpress"; }
+	if ( $nr eq "3" ) { return "Kcms"; }
+	return "";
+}
+
+## out string
+sub getData {
+	( $self ) = @_;
+	%domainsReturnData = $self->runDomainDownloader();
+	$json_data = $self->{'dataParser'}->prepareData( \%domainsReturnData ); # 
+	return $self->{'dataParser'}->decodeData('domainData', $self->getModuleMessage(), $json_data );
+} #---
+
+## get domain data by CURL
+# @param $domainData {domain, script, lastID, type, url}
+# @return string: http status \n time (or -1 if error) \n response CURL data "as is"
+sub goDomain {
+	( $self, $domainData ) = @_;
+	$domain = $domainData->{'domain'};
+	$script = $domainData->{'script'};
+	$lastID = $domainData->{'lastID'};
+	$type = $domainData->{'type'}; # not active! only json support
+	$url = $domainData->{'url'}; # ends with "readerIG" dir
+
+	$curl = new WWW::Curl::Easy;
+	$response_body = "";
+	$curl->setopt(CURLOPT_URL, $url . "getData.php?script=$script&lastID=$lastID&type=json");
+        $curl->setopt(CURLOPT_WRITEDATA,\$response_body);
+
+	$time_start = gettimeofday();
+	$curl->perform;
+
+	$time_do = gettimeofday()-$time_start;
+
+	$err = $curl->errbuf;
+	$httpCode = $curl->getinfo(CURLINFO_HTTP_CODE);
+
+	return "$httpCode\n$time_do\n$response_body";
+
+}
+
+
+## set error message
+sub setError {
+	( $self, $errorCode, $errorMessage ) = @_;
+	$self->{'errorCode'} = $errorCode;
+	$self->{'errorMessage'} = $errorMessage;
+}
+
+## @return string ok|error|error message
+sub getModuleMessage {
+	( $self, $arr ) = @_;
+	if ( $self->{'errorCode'} => 0 ) { return $self->{'errorMessage'}; }
+	return 'ok';
+} #---
+
+
+1;
